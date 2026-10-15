@@ -1,0 +1,331 @@
+# Brazilian financial lakehouse — local stack.
+#
+#   docker compose up -d                   # lite: Postgres + Airflow (DuckDB, DuckLake, dbt)
+#   docker compose --profile full up -d    # full: + RustFS (S3) + Polaris (Iceberg REST) + OpenMetadata
+#
+# Defaults are for local development only. Override them in .env (see .env.example).
+
+name: market-lakehouse
+
+x-postgres-env: &postgres-env
+  AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:-airflow}
+  AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+  DUCKLAKE_DB_USER: ${DUCKLAKE_DB_USER:-ducklake}
+  DUCKLAKE_DB_PASSWORD: ${DUCKLAKE_DB_PASSWORD:-ducklake}
+  POLARIS_DB_USER: ${POLARIS_DB_USER:-polaris}
+  POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris}
+  OPENMETADATA_DB_USER: ${OPENMETADATA_DB_USER:-openmetadata}
+  OPENMETADATA_DB_PASSWORD: ${OPENMETADATA_DB_PASSWORD:-openmetadata}
+
+x-polaris-jdbc-env: &polaris-jdbc-env
+  POLARIS_PERSISTENCE_TYPE: relational-jdbc
+  POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+  QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/polaris
+  QUARKUS_DATASOURCE_USERNAME: ${POLARIS_DB_USER:-polaris}
+  QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris}
+
+x-airflow-common: &airflow-common
+  image: market-lakehouse/airflow:3.3.2
+  # Built once by airflow-init; the other Airflow services reuse it.
+  pull_policy: never
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-SG9_Jn8uRpU3bVx3sqoJCHyKmrAA1Hh0yB_I1ypSVBM=}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-jwt-secret}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Lakehouse connection settings, read by DAGs and dbt profiles.
+    DUCKLAKE_CATALOG_DSN: dbname=ducklake host=postgres user=${DUCKLAKE_DB_USER:-ducklake} password=${DUCKLAKE_DB_PASSWORD:-ducklake}
+    DUCKLAKE_DATA_PATH: /opt/lakehouse/ducklake/
+    POLARIS_URI: http://polaris:8181/api/catalog
+    POLARIS_CATALOG: ${POLARIS_CATALOG:-lakehouse}
+    POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+    POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-s3cr3t}
+    S3_ENDPOINT: http://rustfs:9000
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+    S3_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    OPENMETADATA_HOST: http://openmetadata-server:8585/api
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - airflow-logs:/opt/airflow/logs
+    - ducklake-data:/opt/lakehouse/ducklake
+  user: "50000:0"
+  depends_on: &airflow-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- shared
+  postgres:
+    image: postgres:17.11
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *postgres-env
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- airflow
+  airflow-init:
+    <<: *airflow-common
+    build: ./docker/airflow
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - airflow-logs:/opt/airflow/logs
+      - ducklake-data:/opt/lakehouse/ducklake
+    # Named volumes are created root-owned; hand them to the airflow user.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - chown -R 50000:0 /opt/airflow/logs /opt/lakehouse/ducklake && exec /entrypoint airflow version
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8088}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- object storage (full)
+  rustfs:
+    profiles: [full]
+    image: rustfs/rustfs:1.0.1
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+    ports:
+      - "${RUSTFS_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  rustfs-setup:
+    profiles: [full]
+    image: amazon/aws-cli:2.36.44
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      AWS_REGION: ${S3_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://rustfs:9000
+      S3_BUCKET: ${S3_BUCKET:-lakehouse}
+    entrypoint: /bin/sh
+    command: ["-c", "aws s3api head-bucket --bucket $$S3_BUCKET 2>/dev/null || aws s3 mb s3://$$S3_BUCKET"]
+
+  # ---------------------------------------------------------------- iceberg catalog (full)
+  polaris-bootstrap:
+    profiles: [full]
+    image: apache/polaris-admin-tool:1.8.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *polaris-jdbc-env
+    command:
+      - bootstrap
+      - --realm=POLARIS
+      - --credential=POLARIS,${POLARIS_CLIENT_ID:-root},${POLARIS_CLIENT_SECRET:-s3cr3t}
+
+  polaris:
+    profiles: [full]
+    image: apache/polaris:1.8.0
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
+      rustfs-setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *polaris-jdbc-env
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      # Polaris uses these to vend scoped S3 credentials to engines.
+      AWS_REGION: ${S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      polaris.readiness.ignore-severe-issues: "true"
+    ports:
+      - "${POLARIS_PORT:-8181}:8181"
+      - "${POLARIS_MGMT_PORT:-8182}:8182"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  polaris-setup:
+    profiles: [full]
+    image: alpine/curl:8.22.0
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-s3cr3t}
+      CATALOG_NAME: ${POLARIS_CATALOG:-lakehouse}
+      S3_BUCKET: ${S3_BUCKET:-lakehouse}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      # Endpoint handed to engines; they run inside this network.
+      S3_ENDPOINT: http://rustfs:9000
+    volumes:
+      - ./docker/polaris/setup-catalog.sh:/setup-catalog.sh:ro
+    entrypoint: ["/bin/sh", "/setup-catalog.sh"]
+
+  # ---------------------------------------------------------------- metadata (full)
+  elasticsearch:
+    profiles: [full]
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms1024m -Xmx1024m
+      xpack.security.enabled: "false"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"' || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  openmetadata-migrate:
+    profiles: [full]
+    image: docker.getcollate.io/openmetadata/server:2.0.5
+    command: ./bootstrap/openmetadata-ops.sh migrate
+    environment: &openmetadata-env
+      DB_DRIVER_CLASS: org.postgresql.Driver
+      DB_SCHEME: postgresql
+      DB_PARAMS: sslmode=disable
+      DB_HOST: postgres
+      DB_PORT: 5432
+      OM_DATABASE: openmetadata
+      DB_USER: ${OPENMETADATA_DB_USER:-openmetadata}
+      DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD:-openmetadata}
+      SEARCH_TYPE: elasticsearch
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      SERVER_HOST_API_URL: http://openmetadata-server:8585/api
+      # Metadata ingestion runs as tasks in this stack's Airflow, not OpenMetadata's bundled one.
+      PIPELINE_SERVICE_CLIENT_ENABLED: "false"
+      FERNET_KEY: ${OPENMETADATA_FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  openmetadata-server:
+    profiles: [full]
+    image: docker.getcollate.io/openmetadata/server:2.0.5
+    environment:
+      <<: *openmetadata-env
+    ports:
+      - "${OPENMETADATA_PORT:-8585}:8585"
+      - "${OPENMETADATA_ADMIN_PORT:-8586}:8586"
+    depends_on:
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  ducklake-data:
+  rustfs-data:
+  es-data:
