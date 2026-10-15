@@ -1,6 +1,6 @@
 # Real-time capital markets streaming
 
-Historical B3 market data replayed as a live Kafka stream, processed by Flink. See [ARCHITECTURE.md](ARCHITECTURE.md) and [PRD.md](PRD.md).
+Historical B3 market data replayed as a live Kafka stream, processed by Flink. See [ARCHITECTURE.md](docs/ARCHITECTURE.md), [PRD.md](docs/PRD.md) and the remaining work in [EPICS.md](docs/EPICS.md).
 
 ## Run locally
 
